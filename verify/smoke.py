@@ -3,7 +3,8 @@
 Exercises the whole contract over real HTTP (stdlib only):
   health + SPA, validation, out-of-order PUT, idempotent retransmission,
   409 conflicts that never mutate state, missing-range listing, atomic seal,
-  identical receipt on repeated seal, and sealed-session immutability.
+  identical receipt on repeated seal, sealed-session immutability, and the
+  Merkle delivery proofs (commitment record + range proof rebuilt locally).
 """
 
 from __future__ import annotations
@@ -18,6 +19,68 @@ import urllib.request
 
 BASE = os.environ.get("BASE_URL", "http://localhost:8000").rstrip("/")
 CHUNK = 65536
+
+LEAF_DOMAIN = b"cryo-seal-desk/merkle/v1/leaf:"
+NODE_DOMAIN = b"cryo-seal-desk/merkle/v1/node:"
+
+
+def leaf_hash(index: int, length: int, digest: bytes) -> bytes:
+    return hashlib.sha256(
+        LEAF_DOMAIN + index.to_bytes(8, "big") + length.to_bytes(8, "big") + digest
+    ).digest()
+
+
+def node_hash(left: bytes, right: bytes) -> bytes:
+    return hashlib.sha256(NODE_DOMAIN + left + right).digest()
+
+
+def verify_range_proof(p: dict) -> bool:
+    """Independently rebuild the Merkle root from a proof payload."""
+    n = p["chunk_count"]
+    start, end = p["range"]["start"], p["range"]["end"]
+    digests = [bytes.fromhex(d) for d in p["chunk_digests"]]
+    lengths = [b["length"] for b in p["boundaries"]]
+    proof = [bytes.fromhex(h) for h in p["proof"]]
+    leaves = {
+        start + i: leaf_hash(start + i, lengths[i], digests[i])
+        for i in range(len(digests))
+    }
+    pos = 0
+
+    def width(level: int) -> int:
+        return -(-n // (1 << level))
+
+    def owned(level: int, index: int) -> bytes:
+        if level == 0:
+            return leaves[index]
+        left = owned(level - 1, 2 * index)
+        right = (
+            owned(level - 1, 2 * index + 1)
+            if 2 * index + 1 < width(level - 1)
+            else left
+        )
+        return node_hash(left, right)
+
+    def rebuild(level: int, index: int) -> bytes:
+        nonlocal pos
+        lo = index << level
+        hi = min((index + 1) << level, n) - 1
+        if hi < start or lo > end:
+            value = proof[pos]
+            pos += 1
+            return value
+        if start <= lo and hi <= end:
+            return owned(level, index)
+        left = rebuild(level - 1, 2 * index)
+        right = (
+            rebuild(level - 1, 2 * index + 1)
+            if 2 * index + 1 < width(level - 1)
+            else left
+        )
+        return node_hash(left, right)
+
+    height = (n - 1).bit_length()
+    return rebuild(height, 0).hex() == p["root"] and pos == len(proof)
 
 
 def call(method: str, path: str, body: bytes | None = None, headers=None):
@@ -154,6 +217,39 @@ def main():
     status, body = call("GET", f"/api/uploads/{sb}")
     check(status == 200 and body["sealed"] is False and body["receipt"] is None,
           "no receipt exists after digest mismatch")
+
+    print("[merkle commitment anchored to the receipt]")
+    embedded = receipt.get("commitment") or {}
+    check(embedded.get("algorithm") == "merkle-sha256-v1" and len(embedded.get("root", "")) == 64,
+          "receipt carries the commitment root + algorithm version")
+    status, commitment = call("GET", f"/api/uploads/{s}/commitment")
+    check(status == 200 and commitment["root"] == embedded["root"]
+          and commitment["receipt_id"] == receipt["receipt_id"]
+          and commitment["leaf_count"] == 3,
+          f"commitment record matches the receipt: {commitment.get('root', '?')[:16]}…")
+
+    print("[range proofs verify locally]")
+    status, proof = call("GET", f"/api/uploads/{s}/proof")
+    check(status == 200 and proof["range"] == {"start": 0, "end": 2}
+          and proof["root"] == commitment["root"]
+          and proof["proof"] == [],
+          "full-range proof needs no siblings")
+    check(verify_range_proof(proof), "full-range proof rebuilds the committed root")
+    status, sub = call("GET", f"/api/uploads/{s}/proof?start=1&end=1")
+    check(status == 200 and len(sub["proof"]) > 0, "single-chunk proof carries siblings")
+    check(verify_range_proof(sub), "single-chunk proof rebuilds the committed root")
+    check(sub["boundaries"] == [{"index": 1, "offset": CHUNK, "length": CHUNK}]
+          and sub["chunk_digests"] == [hashlib.sha256(c1).hexdigest()],
+          "boundaries + chunk digests match the original bytes")
+
+    print("[proof endpoint rejects bad input]")
+    for q in ("start=2&end=1", "start=-1", "end=3", "start=x"):
+        status, body = call("GET", f"/api/uploads/{s}/proof?{q}")
+        check(status == 400, f"invalid range {q} -> 400")
+    status, body = call("GET", f"/api/uploads/{sb}/proof")
+    check(status == 409, "unsealed session -> 409")
+    status, body = call("GET", f"/api/uploads/{s}ZZZ/proof")
+    check(status == 404, "unknown session -> 404")
 
     print(f"\nSMOKE OK against {BASE} (sessions {s}, {sb})")
 

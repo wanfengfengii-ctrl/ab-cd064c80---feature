@@ -25,6 +25,45 @@ export interface Receipt {
   chunks: number;
   chunk_size: number;
   sealed_at: string;
+  commitment?: {
+    algorithm: string;
+    root: string;
+    leaf_count: number;
+  } | null;
+}
+
+export interface Commitment {
+  algorithm: string;
+  root: string;
+  leaf_count: number;
+  chunk_size: number;
+  total_size: number;
+  file_sha256: string;
+  receipt_id: string;
+  created_at: string;
+}
+
+export interface ProofBoundary {
+  index: number;
+  offset: number;
+  length: number;
+}
+
+export interface RangeProof {
+  session: string;
+  algorithm: string;
+  receipt_id: string;
+  root: string;
+  chunk_size: number;
+  chunk_count: number;
+  total_size: number;
+  file_sha256: string;
+  range: { start: number; end: number };
+  boundaries: ProofBoundary[];
+  chunk_digests: string[];
+  proof: string[];
+  domains: { leaf: string; node: string };
+  encoding: string;
 }
 
 export interface SessionStatus {
@@ -91,6 +130,28 @@ export async function putChunk(
   });
   if (!res.ok) throw await parseError(res);
   return (await res.json()) as ChunkAck;
+}
+
+export async function fetchCommitment(session: string): Promise<Commitment> {
+  const res = await fetch(`/api/uploads/${session}/commitment`);
+  if (!res.ok) throw await parseError(res);
+  return (await res.json()) as Commitment;
+}
+
+export async function fetchProof(
+  session: string,
+  start?: number,
+  end?: number
+): Promise<RangeProof> {
+  const params = new URLSearchParams();
+  if (start !== undefined) params.set("start", String(start));
+  if (end !== undefined) params.set("end", String(end));
+  const qs = params.toString();
+  const res = await fetch(
+    `/api/uploads/${session}/proof${qs ? `?${qs}` : ""}`
+  );
+  if (!res.ok) throw await parseError(res);
+  return (await res.json()) as RangeProof;
 }
 
 export interface SealResult {

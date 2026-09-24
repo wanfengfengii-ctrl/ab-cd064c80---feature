@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 
 import pytest
 from fastapi.testclient import TestClient
 
+from app import merkle
 from app import main as web
 from app.storage import CHUNK_SIZE, UploadStore
 
@@ -289,4 +291,242 @@ def test_concurrent_out_of_order_puts_then_seal(client):
     r = client.post("/api/uploads/par/seal")
     assert r.status_code == 200
     assert r.json()["sha256"] == sha
+
+
+# ---------------------------------------------------------------------------
+# Merkle commitment & verifiable delivery proofs
+# ---------------------------------------------------------------------------
+
+
+def _upload_and_seal(client, session: str, blob: bytes) -> dict:
+    sha = _digest(blob)
+    for off in range(0, len(blob), CHUNK_SIZE):
+        r = _put(client, session, off, blob[off : off + CHUNK_SIZE], len(blob), sha)
+        assert r.status_code == 200, r.text
+    r = client.post(f"/api/uploads/{session}/seal")
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def _verify_proof_payload(proof: dict) -> bool:
+    return merkle.verify_range(
+        proof["chunk_count"],
+        proof["range"]["start"],
+        proof["range"]["end"],
+        [bytes.fromhex(d) for d in proof["chunk_digests"]],
+        [b["length"] for b in proof["boundaries"]],
+        [bytes.fromhex(h) for h in proof["proof"]],
+        bytes.fromhex(proof["root"]),
+    )
+
+
+def _write_legacy_receipt(data_dir, session: str, blob: bytes) -> None:
+    """Simulate a pre-commitment receipt: no embedded Merkle root."""
+    sha = _digest(blob)
+    legacy = {
+        "receipt_id": "sha256:" + sha,
+        "session": session,
+        "total_size": len(blob),
+        "sha256": sha,
+        "chunks": (len(blob) + CHUNK_SIZE - 1) // CHUNK_SIZE,
+        "chunk_size": CHUNK_SIZE,
+        "sealed_at": "2026-01-01T00:00:00Z",
+    }
+    with open(data_dir / session / "receipt.json", "w") as fh:
+        json.dump(legacy, fh, indent=2)
+
+
+def test_seal_embeds_commitment_and_persists_record(client, tmp_path):
+    blob = os.urandom(3 * CHUNK_SIZE + 11)
+    receipt = _upload_and_seal(client, "mc", blob)
+
+    embedded = receipt["commitment"]
+    assert embedded["algorithm"] == merkle.ALGORITHM
+    assert embedded["leaf_count"] == 4
+    assert len(embedded["root"]) == 64
+
+    record = json.loads((tmp_path / "data" / "mc" / "commitment.json").read_text())
+    assert record["root"] == embedded["root"]
+    assert record["algorithm"] == merkle.ALGORITHM
+    assert record["receipt_id"] == receipt["receipt_id"]
+    assert record["file_sha256"] == _digest(blob)
+
+    r = client.get("/api/uploads/mc/commitment")
+    assert r.status_code == 200
+    assert r.json()["root"] == embedded["root"]
+
+    # repeat seal returns the very same receipt (root atomically anchored)
+    again = client.post("/api/uploads/mc/seal")
+    assert again.status_code == 200 and again.json() == receipt
+
+
+def test_commitment_requires_known_sealed_session(client):
+    assert client.get("/api/uploads/ghost/commitment").status_code == 404
+    blob = os.urandom(10)
+    _put(client, "open", 0, blob, len(blob), _digest(blob))  # complete, unsealed
+    r = client.get("/api/uploads/open/commitment")
+    assert r.status_code == 409
+
+
+def test_proof_full_and_subrange_verify(client):
+    blob = os.urandom(4 * CHUNK_SIZE + 999)
+    receipt = _upload_and_seal(client, "pv", blob)
+
+    # default: whole file
+    proof = client.get("/api/uploads/pv/proof").json()
+    assert proof["range"] == {"start": 0, "end": 4}
+    assert proof["algorithm"] == merkle.ALGORITHM
+    assert proof["receipt_id"] == receipt["receipt_id"]
+    assert proof["root"] == receipt["commitment"]["root"]
+    assert proof["proof"] == []  # full range needs no siblings
+    assert [b["offset"] for b in proof["boundaries"]] == [
+        i * CHUNK_SIZE for i in range(5)
+    ]
+    assert proof["boundaries"][-1]["length"] == 999
+    assert proof["chunk_digests"] == [
+        hashlib.sha256(blob[i * CHUNK_SIZE : (i + 1) * CHUNK_SIZE]).hexdigest()
+        for i in range(5)
+    ]
+    assert _verify_proof_payload(proof)
+
+    # continuous subrange carries a minimal sibling proof
+    sub = client.get("/api/uploads/pv/proof?start=1&end=3").json()
+    assert sub["range"] == {"start": 1, "end": 3}
+    assert sub["root"] == proof["root"]
+    assert 0 < len(sub["proof"]) <= 4
+    assert _verify_proof_payload(sub)
+
+    # single chunk
+    one = client.get("/api/uploads/pv/proof?start=4&end=4").json()
+    assert one["boundaries"] == [
+        {"index": 4, "offset": 4 * CHUNK_SIZE, "length": 999}
+    ]
+    assert _verify_proof_payload(one)
+
+
+def test_proof_range_validation(client):
+    blob = os.urandom(CHUNK_SIZE + 1)  # two chunks
+    _upload_and_seal(client, "rng", blob)
+
+    bad = [
+        "start=2&end=1",      # empty range
+        "start=-1",           # negative
+        "end=2",              # beyond last index (1)
+        "start=0&end=99",     # beyond
+        "start=abc",          # not an integer
+        "start=01",           # non-canonical integer
+        "start=1.0",
+    ]
+    for q in bad:
+        r = client.get(f"/api/uploads/rng/proof?{q}")
+        assert r.status_code == 400, (q, r.status_code)
+    assert client.get("/api/uploads/rng/proof?start=1").status_code == 200
+    assert client.get("/api/uploads/rng/proof?end=0").status_code == 200
+
+
+def test_proof_requires_sealed_session(client):
+    assert client.get("/api/uploads/ghost/proof").status_code == 404
+    blob = os.urandom(10)
+    _put(client, "unsealed", 0, blob, len(blob), _digest(blob))
+    r = client.get("/api/uploads/unsealed/proof")
+    assert r.status_code == 409
+
+
+def test_legacy_receipt_upgraded_without_rewrite(client, tmp_path):
+    data_dir = tmp_path / "data"
+    blob = os.urandom(2 * CHUNK_SIZE + 5)
+    sha = _digest(blob)
+    for off in range(0, len(blob), CHUNK_SIZE):
+        _put(client, "old", off, blob[off : off + CHUNK_SIZE], len(blob), sha)
+    _write_legacy_receipt(data_dir, "old", blob)
+    receipt_path = data_dir / "old" / "receipt.json"
+    before = receipt_path.read_bytes()
+
+    r = client.get("/api/uploads/old/commitment")
+    assert r.status_code == 200, r.text
+    commitment = r.json()
+    assert commitment["algorithm"] == merkle.ALGORITHM
+
+    # the legacy receipt must not be rewritten
+    assert receipt_path.read_bytes() == before
+    # a standalone commitment record appeared
+    assert (data_dir / "old" / "commitment.json").exists()
+
+    proof = client.get("/api/uploads/old/proof?start=0&end=2").json()
+    assert proof["root"] == commitment["root"]
+    assert _verify_proof_payload(proof)
+
+
+def test_legacy_receipt_missing_chunk_refused_and_stays_immutable(client, tmp_path):
+    data_dir = tmp_path / "data"
+    blob = os.urandom(2 * CHUNK_SIZE)
+    sha = _digest(blob)
+    _put(client, "lm", 0, blob[:CHUNK_SIZE], len(blob), sha)
+    _put(client, "lm", CHUNK_SIZE, blob[CHUNK_SIZE:], len(blob), sha)
+    _write_legacy_receipt(data_dir, "lm", blob)
+    os.unlink(data_dir / "lm" / "chunks" / "00000001")
+
+    r = client.get("/api/uploads/lm/commitment")
+    assert r.status_code == 409
+    assert "missing" in r.json()["error"]
+    assert client.get("/api/uploads/lm/proof").status_code == 409
+    assert not (data_dir / "lm" / "commitment.json").exists()
+
+    # session stays sealed-immutable: identical retransmit 200, anything else 409
+    assert _put(client, "lm", 0, blob[:CHUNK_SIZE]).status_code == 200
+    assert _put(client, "lm", 0, b"q" * CHUNK_SIZE).status_code == 409
+    assert _put(client, "lm", CHUNK_SIZE, blob[CHUNK_SIZE:]).status_code == 409
+
+
+def test_legacy_receipt_digest_mismatch_refused(client, tmp_path):
+    data_dir = tmp_path / "data"
+    blob = os.urandom(CHUNK_SIZE)
+    _put(client, "ld", 0, blob, len(blob), _digest(blob))
+    _write_legacy_receipt(data_dir, "ld", blob)
+    # corrupt the stored chunk after sealing
+    (data_dir / "ld" / "chunks" / "00000000").write_bytes(b"x" * CHUNK_SIZE)
+
+    r = client.get("/api/uploads/ld/commitment")
+    assert r.status_code == 409
+    assert "digest" in r.json()["error"]
+    assert client.get("/api/uploads/ld/proof?start=0&end=0").status_code == 409
+    assert not (data_dir / "ld" / "commitment.json").exists()
+
+
+def test_corrupt_receipt_refused_and_session_unwritable(client, tmp_path):
+    data_dir = tmp_path / "data"
+    blob = os.urandom(CHUNK_SIZE)
+    sha = _digest(blob)
+    _put(client, "cr", 0, blob, len(blob), sha)
+    (data_dir / "cr" / "receipt.json").write_bytes(b"{not json")
+
+    r = client.get("/api/uploads/cr/commitment")
+    assert r.status_code == 409
+    assert "corrupt" in r.json()["error"]
+    assert client.get("/api/uploads/cr/proof").status_code == 409
+    # still sealed-immutable
+    assert _put(client, "cr", 0, blob).status_code == 200
+    assert _put(client, "cr", 0, b"z" * CHUNK_SIZE).status_code == 409
+
+
+def test_commitment_and_proofs_survive_restart(client, tmp_path):
+    data_dir = tmp_path / "data"
+    blob = os.urandom(3 * CHUNK_SIZE + 1)
+    receipt = _upload_and_seal(client, "durp", blob)
+    root = receipt["commitment"]["root"]
+
+    web.store = UploadStore(str(data_dir))  # simulated restart
+    r = client.get("/api/uploads/durp/commitment")
+    assert r.status_code == 200 and r.json()["root"] == root
+    proof = client.get("/api/uploads/durp/proof?start=2&end=3").json()
+    assert proof["root"] == root
+    assert _verify_proof_payload(proof)
+
+
+def test_failed_seal_writes_no_commitment(client, tmp_path):
+    blob = os.urandom(50)
+    _put(client, "nc", 0, blob, len(blob), "b" * 64)
+    assert client.post("/api/uploads/nc/seal").status_code == 409
+    assert not (tmp_path / "data" / "nc" / "receipt.json").exists()
+    assert not (tmp_path / "data" / "nc" / "commitment.json").exists()
 

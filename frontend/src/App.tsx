@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   ApiError,
   CHUNK_SIZE,
@@ -6,13 +6,18 @@ import {
   MIN_FILE_SIZE,
   SESSION_RE,
   ChunkAck,
+  Commitment,
+  RangeProof,
   Receipt,
   SessionStatus,
+  fetchCommitment,
+  fetchProof,
   fetchStatus,
   putChunk,
   seal,
   sha256Hex,
 } from "./api";
+import { MERKLE_ALGORITHM, rebuildRoot } from "./merkle";
 import "./styles.css";
 
 interface ChunkError {
@@ -32,6 +37,124 @@ function formatRanges(ranges: [number, number][]): string {
     .join("，");
 }
 
+interface VerifyOutcome {
+  ok: boolean;
+  text: string;
+}
+
+function verifyFail(text: string): VerifyOutcome {
+  return { ok: false, text: `首个失配位置 → ${text}` };
+}
+
+/**
+ * Local verification of a downloaded range proof against a local copy of the
+ * original file: recompute every chunk digest in the proved range, rebuild
+ * the Merkle root with the sibling proof, and report either success or the
+ * FIRST mismatching position.
+ */
+async function verifyProofLocally(
+  proof: RangeProof,
+  localFile: File,
+  onPageReceipt: Receipt | null
+): Promise<VerifyOutcome> {
+  if (proof.algorithm !== MERKLE_ALGORITHM) {
+    return verifyFail(`算法版本不符：${String(proof.algorithm)}`);
+  }
+  const { start, end } = proof.range ?? { start: -1, end: -1 };
+  const count = end - start + 1;
+  if (
+    !Number.isInteger(start) ||
+    !Number.isInteger(end) ||
+    start < 0 ||
+    start > end ||
+    end >= proof.chunk_count ||
+    !Array.isArray(proof.boundaries) ||
+    !Array.isArray(proof.chunk_digests) ||
+    !Array.isArray(proof.proof) ||
+    proof.boundaries.length !== count ||
+    proof.chunk_digests.length !== count
+  ) {
+    return verifyFail("证明文件结构无效（区间/边界/摘要数量不符）");
+  }
+  if (localFile.size !== proof.total_size) {
+    return verifyFail(
+      `文件总长度：本地 ${localFile.size} 字节 ≠ 证明 ${proof.total_size} 字节`
+    );
+  }
+  const localChunks = Math.floor((localFile.size + proof.chunk_size - 1) / proof.chunk_size);
+  if (localChunks !== proof.chunk_count) {
+    return verifyFail(
+      `分块数：本地文件应为 ${localChunks} 块 ≠ 证明 ${proof.chunk_count} 块`
+    );
+  }
+  if (
+    onPageReceipt &&
+    onPageReceipt.commitment &&
+    onPageReceipt.commitment.root !== proof.root
+  ) {
+    return verifyFail(
+      `承诺根：证明根 ${proof.root.slice(0, 16)}… ≠ 当前会话回执承诺根 ${onPageReceipt.commitment.root.slice(0, 16)}…`
+    );
+  }
+  if (onPageReceipt && onPageReceipt.receipt_id !== proof.receipt_id) {
+    return verifyFail(
+      `回执标识：证明 ${proof.receipt_id} ≠ 当前会话回执 ${onPageReceipt.receipt_id}`
+    );
+  }
+  for (let i = start; i <= end; i++) {
+    const boundary = proof.boundaries[i - start];
+    const offset = i * proof.chunk_size;
+    if (boundary.index !== i || boundary.offset !== offset) {
+      return verifyFail(
+        `分块 #${i}：证明边界（index ${boundary.index}, offset ${boundary.offset}）与固定分块规则不符`
+      );
+    }
+    const buf = await localFile
+      .slice(offset, Math.min(offset + proof.chunk_size, localFile.size))
+      .arrayBuffer();
+    if (buf.byteLength !== boundary.length) {
+      return verifyFail(
+        `分块 #${i}（偏移 ${offset}）长度：本地 ${buf.byteLength} ≠ 证明 ${boundary.length}`
+      );
+    }
+    const digest = await sha256Hex(buf);
+    if (digest !== proof.chunk_digests[i - start]) {
+      return verifyFail(
+        `分块 #${i}（偏移 ${offset}）摘要：本地 ${digest.slice(0, 16)}… ≠ 证明 ${proof.chunk_digests[i - start].slice(0, 16)}…`
+      );
+    }
+  }
+  let rebuilt;
+  try {
+    rebuilt = rebuildRoot(
+      proof.chunk_count,
+      start,
+      end,
+      proof.chunk_digests,
+      proof.boundaries.map((b) => b.length),
+      proof.proof
+    );
+  } catch (e) {
+    return verifyFail(`同胞证明无法重建根：${(e as Error).message}`);
+  }
+  if (rebuilt.consumed !== proof.proof.length) {
+    return verifyFail(
+      `同胞证明数量：重建消费 ${rebuilt.consumed} 个 ≠ 证明提供 ${proof.proof.length} 个`
+    );
+  }
+  if (rebuilt.rootHex !== proof.root) {
+    return verifyFail(
+      `Merkle 根：重建 ${rebuilt.rootHex.slice(0, 16)}… ≠ 承诺 ${proof.root.slice(0, 16)}…`
+    );
+  }
+  return {
+    ok: true,
+    text:
+      `校验通过：区间 #${start}–#${end}（${count} 块）的 ${proof.proof.length} 个同胞哈希` +
+      `重建根 ${proof.root.slice(0, 16)}… 与承诺一致，回执 ${proof.receipt_id}`,
+  };
+}
+
 export default function App() {
   const [session, setSession] = useState("");
   const [file, setFile] = useState<File | null>(null);
@@ -45,6 +168,14 @@ export default function App() {
   const [receipt, setReceipt] = useState<Receipt | null>(null);
   const [sealed, setSealed] = useState(false);
   const [notice, setNotice] = useState<string>("");
+  const [commitment, setCommitment] = useState<Commitment | null>(null);
+  const [commitmentMsg, setCommitmentMsg] = useState<string>("");
+  const [proofStart, setProofStart] = useState<string>("");
+  const [proofEnd, setProofEnd] = useState<string>("");
+  const [proofJson, setProofJson] = useState<RangeProof | null>(null);
+  const [proofJsonName, setProofJsonName] = useState<string>("");
+  const [verifyFile, setVerifyFile] = useState<File | null>(null);
+  const [verifyResult, setVerifyResult] = useState<VerifyOutcome | null>(null);
 
   const sessionValid = SESSION_RE.test(session);
   const fileError = useMemo(() => {
@@ -212,6 +343,99 @@ export default function App() {
   const pct = chunkCount ? Math.round((confirmed.size / chunkCount) * 100) : 0;
   const ready = sessionValid && !!file && !fileError && !!digest && !busy;
 
+  const loadCommitment = useCallback(async () => {
+    if (!sessionValid) return;
+    try {
+      const record = await fetchCommitment(session);
+      setCommitment(record);
+      setCommitmentMsg("");
+    } catch (e) {
+      setCommitment(null);
+      setCommitmentMsg(`承诺记录不可用：${(e as Error).message}`);
+    }
+  }, [session, sessionValid]);
+
+  // Once sealed, the commitment record is anchored to the receipt: pull it.
+  useEffect(() => {
+    if (sealed && sessionValid) void loadCommitment();
+  }, [sealed, sessionValid, loadCommitment]);
+
+  // Switching sessions invalidates any downloaded/loaded proof material.
+  useEffect(() => {
+    setCommitment(null);
+    setCommitmentMsg("");
+    setProofJson(null);
+    setProofJsonName("");
+    setVerifyResult(null);
+    setProofStart("");
+    setProofEnd("");
+  }, [session]);
+
+  const handleDownloadProof = useCallback(async () => {
+    const parse = (raw: string): number | undefined | null => {
+      if (raw.trim() === "") return undefined;
+      const n = Number(raw);
+      return Number.isInteger(n) && n >= 0 ? n : null;
+    };
+    const lo = parse(proofStart);
+    const hi = parse(proofEnd);
+    if (lo === null || hi === null) {
+      setVerifyResult({ ok: false, text: "区间起止必须是非负整数（留空表示整份文件）" });
+      return;
+    }
+    setBusy(true);
+    setVerifyResult(null);
+    try {
+      const proof = await fetchProof(session, lo, hi);
+      const name = `proof-${session}-${proof.range.start}-${proof.range.end}.json`;
+      const blob = new Blob([JSON.stringify(proof, null, 2)], {
+        type: "application/json",
+      });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = name;
+      anchor.click();
+      URL.revokeObjectURL(url);
+      // Keep the just-downloaded proof available for instant local checks.
+      setProofJson(proof);
+      setProofJsonName(name);
+    } catch (e) {
+      const err = e as ApiError;
+      setVerifyResult({ ok: false, text: `证明生成被拒绝：${err.message}` });
+    } finally {
+      setBusy(false);
+    }
+  }, [proofStart, proofEnd, session]);
+
+  const onPickProofJson = useCallback(async (picked: File | null) => {
+    if (!picked) return;
+    try {
+      const parsed = JSON.parse(await picked.text()) as RangeProof;
+      setProofJson(parsed);
+      setProofJsonName(picked.name);
+      setVerifyResult(null);
+    } catch {
+      setProofJson(null);
+      setProofJsonName("");
+      setVerifyResult({ ok: false, text: `证明文件 ${picked.name} 不是有效 JSON` });
+    }
+  }, []);
+
+  const handleVerifyProof = useCallback(async () => {
+    const local = verifyFile ?? file;
+    if (!proofJson || !local) return;
+    setBusy(true);
+    try {
+      setVerifyResult(await verifyProofLocally(proofJson, local, receipt));
+    } finally {
+      setBusy(false);
+    }
+  }, [verifyFile, file, proofJson, receipt]);
+
+  const localFileForVerify = verifyFile ?? file;
+  const proofReady = sealed || commitment !== null;
+
   return (
     <main className="page">
       <h1>冷冻电镜采集包 · 断点续传封存台</h1>
@@ -327,7 +551,105 @@ export default function App() {
             <dd>{receipt.sha256}</dd>
             <dt>封存时间 (UTC)</dt>
             <dd>{receipt.sealed_at}</dd>
+            {receipt.commitment && (
+              <>
+                <dt>Merkle 承诺根</dt>
+                <dd>{receipt.commitment.root}</dd>
+              </>
+            )}
           </dl>
+        </section>
+      )}
+
+      {proofReady && (
+        <section className="card">
+          <h2>出库证明（Merkle 承诺 · 连续块区间）</h2>
+
+          {commitment && (
+            <div className="receipt">
+              <dl>
+                <dt>算法版本</dt>
+                <dd>{commitment.algorithm}</dd>
+                <dt>承诺根</dt>
+                <dd>{commitment.root}</dd>
+                <dt>叶子数</dt>
+                <dd>{commitment.leaf_count}</dd>
+                <dt>关联回执</dt>
+                <dd>{commitment.receipt_id}</dd>
+              </dl>
+            </div>
+          )}
+          {commitmentMsg && <div className="notice">{commitmentMsg}</div>}
+
+          <div className="row range-row">
+            <label>
+              起始块号
+              <input
+                type="number"
+                min={0}
+                value={proofStart}
+                placeholder="0"
+                onChange={(e) => setProofStart(e.target.value)}
+                disabled={busy}
+              />
+            </label>
+            <label>
+              结束块号
+              <input
+                type="number"
+                min={0}
+                value={proofEnd}
+                placeholder={chunkCount > 0 ? String(chunkCount - 1) : ""}
+                onChange={(e) => setProofEnd(e.target.value)}
+                disabled={busy}
+              />
+            </label>
+            <button onClick={() => void handleDownloadProof()} disabled={busy || !sessionValid}>
+              下载区间证明（边界 · 块摘要 · 同胞证明 · 回执标识）
+            </button>
+            <button onClick={() => void loadCommitment()} disabled={busy || !sessionValid}>
+              刷新承诺记录
+            </button>
+          </div>
+
+          <h3>本地校验（不上传文件，浏览器内重建根）</h3>
+          <div className="row range-row">
+            <label>
+              证明 JSON（{proofJsonName || "未选择"}）
+              <input
+                type="file"
+                accept="application/json"
+                onClick={(e) => {
+                  e.currentTarget.value = "";
+                }}
+                onChange={(e) => void onPickProofJson(e.target.files?.[0] ?? null)}
+                disabled={busy}
+              />
+            </label>
+            <label>
+              本地原件{file && !verifyFile ? "（默认用上方已选文件）" : ""}
+              <input
+                type="file"
+                onClick={(e) => {
+                  e.currentTarget.value = "";
+                }}
+                onChange={(e) => setVerifyFile(e.target.files?.[0] ?? null)}
+                disabled={busy}
+              />
+            </label>
+            <button
+              className="primary"
+              onClick={() => void handleVerifyProof()}
+              disabled={busy || !proofJson || !localFileForVerify}
+            >
+              本地校验证明
+            </button>
+          </div>
+          {verifyResult && (
+            <div className={verifyResult.ok ? "verify-ok" : "verify-bad"}>
+              {verifyResult.text}
+            </div>
+          )}
         </section>
       )}
     </main>

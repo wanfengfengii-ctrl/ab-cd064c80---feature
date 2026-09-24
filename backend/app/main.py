@@ -13,6 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from .storage import (
     CHUNK_SIZE,
     ConflictError,
+    NotFoundError,
     RejectError,
     UploadStore,
 )
@@ -56,6 +57,11 @@ def _reject_handler(_request: Request, exc: RejectError) -> JSONResponse:
 @app.exception_handler(ConflictError)
 def _conflict_handler(_request: Request, exc: ConflictError) -> JSONResponse:
     return JSONResponse(status_code=409, content={"error": str(exc)})
+
+
+@app.exception_handler(NotFoundError)
+def _not_found_handler(_request: Request, exc: NotFoundError) -> JSONResponse:
+    return JSONResponse(status_code=404, content={"error": str(exc)})
 
 
 @app.get("/health")
@@ -117,6 +123,26 @@ def seal(session: str) -> JSONResponse:
             },
         )
     return JSONResponse(status_code=200, content=result)
+
+
+@app.get("/api/uploads/{session}/commitment")
+def get_commitment(session: str) -> dict:
+    """Merkle commitment record anchored to the session's seal receipt."""
+    _check_session(session)
+    return store.get_commitment(session)
+
+
+@app.get("/api/uploads/{session}/proof")
+def get_proof(
+    session: str,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+) -> dict:
+    """Verifiable delivery proof for a continuous chunk range [start, end]."""
+    _check_session(session)
+    lo = _parse_int("start", start)
+    hi = _parse_int("end", end)
+    return store.get_proof(session, lo, hi)
 
 
 # Serve the built React SPA from the same origin (API routes take priority).

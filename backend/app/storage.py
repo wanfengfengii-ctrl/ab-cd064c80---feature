@@ -22,6 +22,8 @@ import threading
 from dataclasses import dataclass
 from typing import Optional
 
+from . import merkle
+
 CHUNK_SIZE = 65536
 
 # Default limits; can be overridden through the environment.
@@ -106,6 +108,10 @@ class ConflictError(Exception):
     """Content/metadata of an idempotent retransmission does not match."""
 
 
+class NotFoundError(Exception):
+    """The requested session does not exist at all."""
+
+
 class RejectError(Exception):
     """Chunk index/offset/length is malformed (mapped to HTTP 400)."""
 
@@ -132,6 +138,9 @@ class UploadStore:
 
     def _receipt_path(self, session: str) -> str:
         return os.path.join(self._dir(session), "receipt.json")
+
+    def _commitment_path(self, session: str) -> str:
+        return os.path.join(self._dir(session), "commitment.json")
 
     # ---- reads -----------------------------------------------------------
 
@@ -173,7 +182,8 @@ class UploadStore:
                 "chunk_count": meta.chunk_count,
                 "confirmed_chunks": present,
                 "missing_ranges": _missing_ranges(set(present), meta.chunk_count),
-                "sealed": receipt is not None,
+                # existence marks the seal; a corrupt receipt still means sealed
+                "sealed": os.path.exists(self._receipt_path(session)),
                 "receipt": receipt,
             }
 
@@ -246,7 +256,9 @@ class UploadStore:
                     ).encode(),
                 )
 
-            sealed = self._read_receipt(session) is not None
+            # receipt.json existing at all means sealed, even if its content
+            # is unreadable: a corrupt receipt must keep the session frozen.
+            sealed = os.path.exists(self._receipt_path(session))
             path = self._chunk_path(session, index)
             if os.path.exists(path):
                 with open(path, "rb") as fh:
@@ -319,6 +331,11 @@ class UploadStore:
             prior = self._read_receipt(session)
             if prior is not None:
                 return prior, True, None
+            if os.path.exists(self._receipt_path(session)):
+                # A receipt file exists but is unreadable: never overwrite it.
+                raise ConflictError(
+                    "sealed receipt is corrupt; refusing to modify the session"
+                )
 
             present = self._present_indices(session, meta.chunk_count)
             missing = _missing_ranges(present, meta.chunk_count)
@@ -326,17 +343,34 @@ class UploadStore:
                 return {}, False, missing
 
             digest = hashlib.sha256()
+            chunk_digests: list[bytes] = []
+            chunk_lengths: list[int] = []
             for i in range(meta.chunk_count):
                 with open(self._chunk_path(session, i), "rb") as fh:
-                    digest.update(fh.read())
+                    data = fh.read()
+                digest.update(data)
+                chunk_digests.append(hashlib.sha256(data).digest())
+                chunk_lengths.append(len(data))
             actual = digest.hexdigest()
             if actual != meta.sha256:
                 raise ConflictError(
                     f"server digest {actual} does not match declared {meta.sha256}"
                 )
 
+            receipt_id = _DIGEST_PREFIX + actual
+            commitment = self._build_commitment(
+                session, meta, actual, receipt_id, chunk_digests, chunk_lengths
+            )
+            # The commitment lands first; the receipt (whose appearance marks
+            # the session as sealed) is written last, inside the same lock, so
+            # a visible receipt always implies its commitment is on disk.
+            _atomic_write(
+                self._commitment_path(session),
+                json.dumps(commitment, indent=2).encode(),
+            )
+
             receipt = {
-                "receipt_id": _DIGEST_PREFIX + actual,
+                "receipt_id": receipt_id,
                 "session": session,
                 "total_size": meta.total_size,
                 "sha256": actual,
@@ -345,8 +379,252 @@ class UploadStore:
                 "sealed_at": datetime.datetime.now(datetime.timezone.utc)
                 .isoformat(timespec="seconds")
                 .replace("+00:00", "Z"),
+                "commitment": {
+                    "algorithm": commitment["algorithm"],
+                    "root": commitment["root"],
+                    "leaf_count": commitment["leaf_count"],
+                },
             }
             seal_marker = json.dumps(receipt, indent=2).encode()
             # Write the receipt atomically; from this instant the session is sealed.
             _atomic_write(self._receipt_path(session), seal_marker)
             return receipt, True, None
+
+    # ---- Merkle commitment & range proofs ---------------------------------
+
+    @staticmethod
+    def _build_commitment(
+        session: str,
+        meta: Metadata,
+        file_sha256: str,
+        receipt_id: str,
+        chunk_digests: list[bytes],
+        chunk_lengths: list[int],
+    ) -> dict:
+        leaf_hashes = [
+            merkle.leaf_hash(i, chunk_lengths[i], chunk_digests[i])
+            for i in range(meta.chunk_count)
+        ]
+        return {
+            "algorithm": merkle.ALGORITHM,
+            "root": merkle.build_root(leaf_hashes).hex(),
+            "leaf_count": meta.chunk_count,
+            "chunk_size": CHUNK_SIZE,
+            "total_size": meta.total_size,
+            "file_sha256": file_sha256,
+            "receipt_id": receipt_id,
+            "created_at": datetime.datetime.now(datetime.timezone.utc)
+            .isoformat(timespec="seconds")
+            .replace("+00:00", "Z"),
+        }
+
+    def _read_commitment(self, session: str) -> Optional[dict]:
+        try:
+            raw = _read_json(self._commitment_path(session))
+        except (FileNotFoundError, json.JSONDecodeError):
+            return None
+        if not isinstance(raw, dict):
+            return None
+        required = ("algorithm", "root", "leaf_count", "receipt_id")
+        if any(field not in raw for field in required):
+            return None
+        if raw["algorithm"] != merkle.ALGORITHM:
+            return None
+        return raw
+
+    def _read_receipt_strict(self, session: str) -> Optional[dict]:
+        """Receipt for proof purposes; any corruption is a hard 409."""
+        try:
+            raw = _read_json(self._receipt_path(session))
+        except FileNotFoundError:
+            return None
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            raise ConflictError("sealed receipt is corrupt: not valid JSON")
+        if not isinstance(raw, dict):
+            raise ConflictError("sealed receipt is corrupt: not a JSON object")
+        for field in ("receipt_id", "session", "total_size", "sha256", "chunks"):
+            if field not in raw:
+                raise ConflictError(
+                    f"sealed receipt is corrupt: missing field {field!r}"
+                )
+        return raw
+
+    def _sealed_state(self, session: str) -> tuple[Metadata, dict]:
+        """(meta, receipt) of a provably sealed session, or raise."""
+        meta = self.get_metadata(session)
+        if meta is None:
+            raise NotFoundError("no such session")
+        receipt = self._read_receipt_strict(session)
+        if receipt is None:
+            raise ConflictError(
+                "session is not sealed; proofs only exist for sealed sessions"
+            )
+        if (
+            not isinstance(receipt.get("chunks"), int)
+            or not isinstance(receipt.get("total_size"), int)
+            or receipt["chunks"] != meta.chunk_count
+            or receipt["total_size"] != meta.total_size
+        ):
+            raise ConflictError(
+                "sealed receipt is corrupt: inconsistent with stored metadata"
+            )
+        return meta, receipt
+
+    def _scan_chunks(
+        self, session: str, meta: Metadata
+    ) -> tuple[list[bytes], list[int], str]:
+        """Full scan: per-chunk digests, lengths and whole-file digest."""
+        chunk_digests: list[bytes] = []
+        chunk_lengths: list[int] = []
+        digest = hashlib.sha256()
+        missing: list[int] = []
+        for i in range(meta.chunk_count):
+            path = self._chunk_path(session, i)
+            if not os.path.exists(path):
+                missing.append(i)
+                continue
+            with open(path, "rb") as fh:
+                data = fh.read()
+            digest.update(data)
+            chunk_digests.append(hashlib.sha256(data).digest())
+            chunk_lengths.append(len(data))
+        if missing:
+            raise ConflictError(
+                f"cannot prove: {len(missing)} chunk(s) missing on disk "
+                f"(first missing index {missing[0]})"
+            )
+        return chunk_digests, chunk_lengths, digest.hexdigest()
+
+    def _ensure_commitment(
+        self, session: str, meta: Metadata, receipt: dict
+    ) -> dict:
+        """Return the commitment record, building it for legacy receipts.
+
+        A legacy receipt (no embedded commitment root) is upgraded to a
+        standalone commitment.json only after a full chunk scan whose
+        recomputed whole-file digest matches the receipt. The legacy receipt
+        itself is never rewritten.
+        """
+        embedded = receipt.get("commitment")
+        embedded_root: Optional[str] = None
+        if embedded is not None:
+            if not isinstance(embedded, dict) or not _is_sha256_hex(
+                str(embedded.get("root", ""))
+            ):
+                raise ConflictError(
+                    "sealed receipt is corrupt: malformed commitment field"
+                )
+            embedded_root = embedded["root"]
+
+        stored = self._read_commitment(session)
+        if stored is not None:
+            if embedded_root is not None and stored["root"] != embedded_root:
+                raise ConflictError(
+                    "commitment record does not match the sealed receipt"
+                )
+            return stored
+
+        chunk_digests, chunk_lengths, actual = self._scan_chunks(session, meta)
+        if actual != receipt["sha256"]:
+            raise ConflictError(
+                "recomputed whole-file digest does not match the sealed "
+                "receipt; refusing to build a commitment"
+            )
+        commitment = self._build_commitment(
+            session,
+            meta,
+            actual,
+            str(receipt["receipt_id"]),
+            chunk_digests,
+            chunk_lengths,
+        )
+        if embedded_root is not None and commitment["root"] != embedded_root:
+            raise ConflictError(
+                "chunk data no longer matches the committed root in the receipt"
+            )
+        _atomic_write(
+            self._commitment_path(session),
+            json.dumps(commitment, indent=2).encode(),
+        )
+        return commitment
+
+    def get_commitment(self, session: str) -> dict:
+        _validate_session(session)
+        with self._lock:
+            meta, receipt = self._sealed_state(session)
+            return self._ensure_commitment(session, meta, receipt)
+
+    def get_proof(
+        self, session: str, start: Optional[int], end: Optional[int]
+    ) -> dict:
+        """Verifiable delivery proof for a continuous chunk range."""
+        _validate_session(session)
+        with self._lock:
+            meta, receipt = self._sealed_state(session)
+            commitment = self._ensure_commitment(session, meta, receipt)
+
+            n = meta.chunk_count
+            lo = 0 if start is None else start
+            hi = n - 1 if end is None else end
+            for name, value in (("start", lo), ("end", hi)):
+                if not isinstance(value, int) or isinstance(value, bool):
+                    raise RejectError(f"range {name} must be an integer")
+            if lo < 0:
+                raise RejectError("range start must be >= 0")
+            if hi > n - 1:
+                raise RejectError(
+                    f"range end {hi} is beyond the last chunk index {n - 1}"
+                )
+            if lo > hi:
+                raise RejectError(
+                    f"range start {lo} is after range end {hi}; "
+                    "only continuous non-empty ranges are provable"
+                )
+
+            # Every proof is built from a fresh full scan and checked against
+            # the committed root: missing chunks or drifted bytes are refused.
+            chunk_digests, chunk_lengths, actual = self._scan_chunks(session, meta)
+            if actual != receipt["sha256"]:
+                raise ConflictError(
+                    "recomputed whole-file digest does not match the sealed "
+                    "receipt; refusing to prove"
+                )
+            leaf_hashes = [
+                merkle.leaf_hash(i, chunk_lengths[i], chunk_digests[i])
+                for i in range(n)
+            ]
+            root = merkle.build_root(leaf_hashes).hex()
+            if root != commitment["root"]:
+                raise ConflictError(
+                    "chunk data no longer matches the committed Merkle root"
+                )
+
+            proof = merkle.range_proof(leaf_hashes, lo, hi)
+            return {
+                "session": session,
+                "algorithm": merkle.ALGORITHM,
+                "receipt_id": commitment["receipt_id"],
+                "root": commitment["root"],
+                "chunk_size": CHUNK_SIZE,
+                "chunk_count": n,
+                "total_size": meta.total_size,
+                "file_sha256": actual,
+                "range": {"start": lo, "end": hi},
+                "boundaries": [
+                    {
+                        "index": i,
+                        "offset": i * CHUNK_SIZE,
+                        "length": chunk_lengths[i],
+                    }
+                    for i in range(lo, hi + 1)
+                ],
+                "chunk_digests": [
+                    chunk_digests[i].hex() for i in range(lo, hi + 1)
+                ],
+                "proof": [h.hex() for h in proof],
+                "domains": {
+                    "leaf": merkle.LEAF_DOMAIN.decode("ascii"),
+                    "node": merkle.NODE_DOMAIN.decode("ascii"),
+                },
+                "encoding": merkle.ENCODING_DOC,
+            }

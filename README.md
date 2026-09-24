@@ -17,6 +17,32 @@ TypeScript/React 前端 + FastAPI 后端的全栈封存台。上传中断（断�
   此后不可新增/更改分块（相同重传仍 200，不同内容 409）。
 - 重复封存返回**同一份回执**；缺块返回 409 并列出 `missing_ranges`（闭区间块号）；
   摘要不符返回 409 且不产生回执文件。
+- 封存成功的同一临界区内：先原子落盘 `commitment.json`（Merkle 承诺记录），
+  再原子落盘内嵌 `commitment{algorithm, root, leaf_count}` 的回执——
+  **回执出现的瞬间承诺必然已关联**。
+
+## 出库证明（Merkle 承诺）
+
+算法版本 `merkle-sha256-v1`，域分隔编码：
+
+```
+leaf = SHA256("cryo-seal-desk/merkle/v1/leaf:" | index:u64be | length:u64be | chunk_sha256)
+node = SHA256("cryo-seal-desk/merkle/v1/node:" | left | right)
+```
+
+叶子按固定分块顺序绑定**块序号、实际长度、块摘要**；逐层构建，**奇数层固定复制末节点**
+（`node(h, h)`）；单叶树根即叶子本身。
+
+- `GET /api/uploads/{session}/commitment` → 承诺记录（算法版本、根、叶数、关联回执标识）。
+- `GET /api/uploads/{session}/proof?start=S&end=E` → 连续闭区间 `[S, E]` 的出库证明：
+  边界（块号/偏移/实际长度）、块摘要、**最小同胞证明**（前序、左先右后）、回执标识、
+  承诺根与域分隔标签。缺省参数即整份文件。接收方无需整份采集包即可用区间块字节
+  重建根并比对承诺。前端已封存页面可下载证明 JSON 并**本地重建根校验**，
+  显示通过或首个失配位置（块号/偏移/根）。
+- 仅已封存会话可证明：未封存 409、未知会话 404、非法区间（空区间/越界/负值/非整数）400。
+- **旧回执兼容**：`receipt.json` 无承诺根时，只有完整扫描全部落盘分块且重算整文件
+  摘要与回执一致，才生成**独立** `commitment.json`；旧回执绝不改写。
+  缺块、摘要不符或回执损坏 → 409 拒绝证明，会话保持封存不可写。
 
 ## API
 
@@ -26,6 +52,8 @@ TypeScript/React 前端 + FastAPI 后端的全栈封存台。上传中断（断�
 | `GET` | `/api/uploads/{session}` | 会话状态：已确认块、缺失范围、回执 |
 | `PUT` | `/api/uploads/{session}/chunks` | 上传/重传一个分块（头见上） |
 | `POST` | `/api/uploads/{session}/seal` | 原子封存；已封存则返回原回执 |
+| `GET` | `/api/uploads/{session}/commitment` | Merkle 承诺记录（仅已封存会话） |
+| `GET` | `/api/uploads/{session}/proof?start=S&end=E` | 连续块区间的可核验出库证明 |
 
 ## 持久化与崩溃安全
 
@@ -34,7 +62,8 @@ TypeScript/React 前端 + FastAPI 后端的全栈封存台。上传中断（断�
 ```
 meta.json      # 元数据，首次合法分块时原子写入后不可变
 chunks/00000000 …  # 每块一个文件，写临时文件 + fsync + rename 原子落盘
-receipt.json   # 仅封存成功后原子出现；存在即代表已封存
+receipt.json   # 仅封存成功后原子出现；存在即代表已封存（损坏也不改写）
+commitment.json  # Merkle 承诺记录；随封存原子生成，或为旧回执补建（不改写回执）
 ```
 
 所有写操作经进程内锁串行化，落盘均为「临时文件 → fsync → 原子 rename → fsync 目录」，
@@ -49,7 +78,9 @@ HTTP 局域网等非安全上下文自动回退到内置纯 TS 实现），逐�
 - 每块错误（含定位偏移；409 明确提示数据被拒绝覆盖）；
 - **重选原文件**即用原会话号**重发所有块**（服务端去重），断线后如此恢复；
 - 「查询/恢复服务器进度」可在页面刷新/重启后拉回服务端权威状态；
-- 封存后展示唯一回执。
+- 封存后展示唯一回执（含内嵌 Merkle 承诺根）；
+- 已封存页面可选择连续块号区间下载出库证明 JSON（边界、块摘要、最小同胞证明、
+  回执标识），并用本地原件在浏览器内重建 Merkle 根校验，显示通过或首个失配位置。
 
 ## 运行（Docker Compose）
 
@@ -75,10 +106,12 @@ docker compose run --rm verify
 
 阶段（任一失败立即非零退出）：
 
-1. `pytest`：后端 15 个测试（乱序、幂等、409 不改状态、定位拒绝、缺块范围、
-   摘要不符无回执、封存后不可变、跨"重启"持久化、边界尺寸）；
+1. `pytest`：后端 36 个测试（乱序、幂等、409 不改状态、定位拒绝、缺块范围、
+   摘要不符无回执、封存后不可变、跨"重启"持久化、边界尺寸、Merkle 编码/补位规则/
+   最小证明往返、承诺原子关联、区间校验、旧回执升级与拒证路径）；
 2. `npm run build`：`tsc` 类型检查 + Vite 构建；
-3. `verify/smoke.py`：对 `http://web:8000` 的纯 stdlib HTTP 全链路冒烟。
+3. `verify/smoke.py`：对 `http://web:8000` 的纯 stdlib HTTP 全链路冒烟
+   （含承诺记录与区间证明的独立重建根校验）。
 
 ## 本地开发
 

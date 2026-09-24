@@ -215,3 +215,49 @@ button.primary:hover:not(:disabled) {
   font-family: ui-monospace, Menlo, Consolas, monospace;
   word-break: break-all;
 }
+
+.card h3 {
+  font-size: 14px;
+  margin: 16px 0 8px;
+}
+
+.range-row {
+  align-items: flex-end;
+}
+
+.range-row label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: #5a6b7d;
+}
+
+.range-row input[type="number"] {
+  width: 110px;
+  padding: 8px 10px;
+  border: 1px solid #c4d0dd;
+  border-radius: 7px;
+  font-size: 14px;
+}
+
+.verify-ok,
+.verify-bad {
+  margin-top: 12px;
+  font-size: 13px;
+  border-radius: 7px;
+  padding: 9px 12px;
+  word-break: break-all;
+}
+
+.verify-ok {
+  color: #145a32;
+  background: #e9f7ef;
+  border: 1px solid #b7e4c7;
+}
+
+.verify-bad {
+  color: #9b2c22;
+  background: #fdecea;
+  border: 1px solid #f5c6c0;
+}
