@@ -6,13 +6,17 @@ import {
   MIN_FILE_SIZE,
   SESSION_RE,
   ChunkAck,
+  RangeProof,
   Receipt,
   SessionStatus,
+  buildLegacyCommitment,
+  fetchRangeProof,
   fetchStatus,
   putChunk,
   seal,
   sha256Hex,
 } from "./api";
+import { verifyProofAgainstFile, verifyRangeProof, type VerifyOutcome } from "./merkle";
 import "./styles.css";
 
 interface ChunkError {
@@ -45,6 +49,13 @@ export default function App() {
   const [receipt, setReceipt] = useState<Receipt | null>(null);
   const [sealed, setSealed] = useState(false);
   const [notice, setNotice] = useState<string>("");
+  // 出库证明（Merkle 承诺）状态
+  const [proofStart, setProofStart] = useState("0");
+  const [proofEnd, setProofEnd] = useState("");
+  const [proofBusy, setProofBusy] = useState(false);
+  const [proof, setProof] = useState<RangeProof | null>(null);
+  const [verifyOutcome, setVerifyOutcome] = useState<VerifyOutcome | null>(null);
+  const [legacyRoot, setLegacyRoot] = useState<string | null>(null);
 
   const sessionValid = SESSION_RE.test(session);
   const fileError = useMemo(() => {
@@ -66,6 +77,9 @@ export default function App() {
     setNotice("");
     setChunkCount(0);
     setTotalSize(0);
+    setProof(null);
+    setVerifyOutcome(null);
+    setLegacyRoot(null);
   }, []);
 
   const onPickFile = useCallback(
@@ -197,6 +211,9 @@ export default function App() {
       setConfirmed(new Set(status.confirmed_chunks));
       setSealed(status.sealed);
       setReceipt(status.receipt);
+      setLegacyRoot(status.commitment?.merkle_root ?? null);
+      setProof(null);
+      setVerifyOutcome(null);
       setNotice(
         status.sealed
           ? "该会话已封存，回执如下（服务重启后仍然保留）。"
@@ -208,6 +225,112 @@ export default function App() {
       setBusy(false);
     }
   }, [resetProgress, session, sessionValid]);
+
+  // ---- 出库证明：下载 + 本地校验 -------------------------------------------
+
+  // 承诺根优先取回执内嵌字段；旧回执经完整扫描后取独立承诺记录。
+  const commitmentRoot = receipt?.merkle_root ?? legacyRoot;
+  const effectiveProofEnd =
+    proofEnd === "" ? String(Math.max(0, chunkCount - 1)) : proofEnd;
+
+  const parseRange = useCallback((): { start: number; end: number } | null => {
+    if (!/^\d+$/.test(proofStart) || !/^\d+$/.test(effectiveProofEnd)) return null;
+    const start = Number(proofStart);
+    const end = Number(effectiveProofEnd);
+    if (start > end || end >= chunkCount) return null;
+    return { start, end };
+  }, [proofStart, effectiveProofEnd, chunkCount]);
+
+  const handleFetchProof = useCallback(
+    async (download: boolean) => {
+      const range = parseRange();
+      if (!range) {
+        setVerifyOutcome({ ok: false, message: "块号区间无效：需为 0 起的连续闭区间且不越界" });
+        return;
+      }
+      setProofBusy(true);
+      try {
+        const p = await fetchRangeProof(session, range.start, range.end);
+        setProof(p);
+        setVerifyOutcome(null);
+        if (download) {
+          const blob = new Blob([JSON.stringify(p, null, 2)], {
+            type: "application/json",
+          });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = `proof-${session}-${range.start}-${range.end}.json`;
+          a.click();
+          URL.revokeObjectURL(url);
+        }
+      } catch (e) {
+        setProof(null);
+        setVerifyOutcome({
+          ok: false,
+          message: `获取证明被拒绝：${(e as ApiError).message}`,
+        });
+      } finally {
+        setProofBusy(false);
+      }
+    },
+    [parseRange, session]
+  );
+
+  const handleVerify = useCallback(async () => {
+    setProofBusy(true);
+    setVerifyOutcome(null);
+    try {
+      let p = proof;
+      if (!p) {
+        const range = parseRange();
+        if (!range) {
+          setVerifyOutcome({ ok: false, message: "块号区间无效：需为 0 起的连续闭区间且不越界" });
+          return;
+        }
+        p = await fetchRangeProof(session, range.start, range.end);
+        setProof(p);
+      }
+      // 先与页面上受信的承诺根（回执/独立承诺记录）比对，再逐块重建根。
+      if (commitmentRoot && p.merkle_root !== commitmentRoot) {
+        setVerifyOutcome({
+          ok: false,
+          message:
+            `证明携带的根 ${p.merkle_root.slice(0, 16)}… 与回执承诺根 ` +
+            `${commitmentRoot.slice(0, 16)}… 不一致`,
+        });
+        return;
+      }
+      const structural = await verifyRangeProof(p);
+      if (!structural.ok || !file) {
+        setVerifyOutcome(structural);
+        return;
+      }
+      const bytes = await verifyProofAgainstFile(p, file);
+      setVerifyOutcome(
+        bytes.ok
+          ? { ok: true, message: `${structural.message}；${bytes.message}` }
+          : bytes
+      );
+    } catch (e) {
+      setVerifyOutcome({ ok: false, message: `校验失败：${(e as Error).message}` });
+    } finally {
+      setProofBusy(false);
+    }
+  }, [proof, parseRange, session, file, commitmentRoot]);
+
+  const handleLegacyRescan = useCallback(async () => {
+    setProofBusy(true);
+    try {
+      const record = await buildLegacyCommitment(session);
+      setLegacyRoot(record.merkle_root);
+      setNotice("已为旧回执生成独立承诺记录（完整扫描通过，旧回执未被改写）。");
+    } catch (e) {
+      setNotice(`生成承诺记录被拒绝：${(e as ApiError).message}`);
+    } finally {
+      setProofBusy(false);
+    }
+  }, [session]);
 
   const pct = chunkCount ? Math.round((confirmed.size / chunkCount) * 100) : 0;
   const ready = sessionValid && !!file && !fileError && !!digest && !busy;
@@ -327,7 +450,108 @@ export default function App() {
             <dd>{receipt.sha256}</dd>
             <dt>封存时间 (UTC)</dt>
             <dd>{receipt.sealed_at}</dd>
+            <dt>Merkle 算法</dt>
+            <dd>{receipt.merkle_algorithm ?? "（旧回执：未内嵌承诺根）"}</dd>
+            <dt>承诺根</dt>
+            <dd>{receipt.merkle_root ?? (legacyRoot ?? "—（旧回执，需完整扫描生成独立承诺）")}</dd>
           </dl>
+        </section>
+      )}
+
+      {sealed && (
+        <section className="card proof-card">
+          <h2>连续分块出库证明</h2>
+          <p className="hint">
+            为已封存会话选择连续闭区间块号，导出边界、块摘要与最小同胞证明；
+            接收方无需整份采集包即可本地重建二叉 Merkle 根并与回执标识比对。
+            奇数层采用「末节点直接提升」的固定补位规则，叶子绑定块序号、实际长度与块摘要。
+          </p>
+
+          {!commitmentRoot && (
+            <div className="row">
+              <button
+                onClick={() => void handleLegacyRescan()}
+                disabled={!sessionValid || proofBusy}
+              >
+                为旧回执完整扫描并生成独立承诺记录
+              </button>
+            </div>
+          )}
+
+          <div className="range-row">
+            <label>
+              起始块号
+              <input
+                type="text"
+                inputMode="numeric"
+                value={proofStart}
+                placeholder="0"
+                disabled={proofBusy}
+                onChange={(e) => setProofStart(e.target.value.trim())}
+              />
+            </label>
+            <label>
+              结束块号（留空 = {Math.max(0, chunkCount - 1)}）
+              <input
+                type="text"
+                inputMode="numeric"
+                value={proofEnd}
+                placeholder={String(Math.max(0, chunkCount - 1))}
+                disabled={proofBusy}
+                onChange={(e) => setProofEnd(e.target.value.trim())}
+              />
+            </label>
+            <span className="range-hint">共 {chunkCount > 0 ? chunkCount : "—"} 块</span>
+          </div>
+
+          <div className="row">
+            <button
+              className="primary"
+              onClick={() => void handleFetchProof(true)}
+              disabled={!sessionValid || proofBusy || chunkCount === 0}
+            >
+              下载区间证明
+            </button>
+            <button
+              onClick={() => void handleFetchProof(false)}
+              disabled={!sessionValid || proofBusy || chunkCount === 0}
+            >
+              仅查看证明
+            </button>
+            <button
+              onClick={() => void handleVerify()}
+              disabled={!sessionValid || proofBusy || chunkCount === 0}
+            >
+              本地重建根并校验{file ? "（对照所选文件）" : "（仅证明结构）"}
+            </button>
+          </div>
+
+          {verifyOutcome && (
+            <div className={`notice ${verifyOutcome.ok ? "verify-ok" : "verify-bad"}`}>
+              {verifyOutcome.ok ? "✓ " : "✗ "}
+              {verifyOutcome.message}
+            </div>
+          )}
+
+          {proof && (
+            <div className="proof-detail">
+              <div>算法：{proof.algorithm}</div>
+              <div className="digest">承诺根：{proof.merkle_root}</div>
+              <div>回执标识：{proof.receipt_id}</div>
+              <div>
+                区间：#{proof.range.start}–#{proof.range.end}（{proof.blocks.length} 块）·
+                总块数 {proof.chunk_count}
+              </div>
+              <ul className="proof-blocks">
+                {proof.blocks.map((b) => (
+                  <li key={b.index}>
+                    #{b.index} · 偏移 {b.offset} · 长度 {b.length} · 同胞 {b.proof.length} 个
+                    <span className="digest">{b.sha256}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
         </section>
       )}
     </main>

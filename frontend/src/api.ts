@@ -25,6 +25,52 @@ export interface Receipt {
   chunks: number;
   chunk_size: number;
   sealed_at: string;
+  // Present on receipts sealed by current code; absent on legacy receipts.
+  merkle_root?: string;
+  merkle_algorithm?: string;
+}
+
+export interface CommitmentLeaf {
+  index: number;
+  length: number;
+  sha256: string;
+}
+
+export interface Commitment {
+  algorithm: string;
+  merkle_root: string;
+  receipt_id: string;
+  session: string;
+  chunk_size: number;
+  chunk_count: number;
+  total_size: number;
+  file_sha256: string;
+  leaves: CommitmentLeaf[];
+}
+
+export interface ProofSibling {
+  side: "left" | "right";
+  digest: string;
+}
+
+export interface ProofBlock {
+  index: number;
+  offset: number;
+  length: number;
+  sha256: string;
+  proof: ProofSibling[];
+}
+
+export interface RangeProof {
+  session: string;
+  algorithm: string;
+  merkle_root: string;
+  receipt_id: string;
+  file_sha256: string;
+  chunk_size: number;
+  chunk_count: number;
+  range: { start: number; end: number };
+  blocks: ProofBlock[];
 }
 
 export interface SessionStatus {
@@ -36,6 +82,7 @@ export interface SessionStatus {
   missing_ranges: [number, number][];
   sealed: boolean;
   receipt: Receipt | null;
+  commitment?: Commitment | null;
 }
 
 export class ApiError extends Error {
@@ -118,6 +165,28 @@ export async function seal(session: string): Promise<SealResult> {
       ? ((err.body as { missing_ranges: [number, number][] }).missing_ranges ?? null)
       : null;
   return { status: res.status, receipt: null, missingRanges: ranges, error: err.message };
+}
+
+export async function fetchRangeProof(
+  session: string,
+  start: number,
+  end: number
+): Promise<RangeProof> {
+  const res = await fetch(
+    `/api/uploads/${session}/proof?start=${start}&end=${end}`
+  );
+  if (!res.ok) throw await parseError(res);
+  return (await res.json()) as RangeProof;
+}
+
+export async function buildLegacyCommitment(
+  session: string
+): Promise<Commitment> {
+  const res = await fetch(`/api/uploads/${session}/commitment`, {
+    method: "POST",
+  });
+  if (!res.ok) throw await parseError(res);
+  return (await res.json()) as Commitment;
 }
 
 import { sha256Bytes } from "./sha256";

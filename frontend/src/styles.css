@@ -215,3 +215,76 @@ button.primary:hover:not(:disabled) {
   font-family: ui-monospace, Menlo, Consolas, monospace;
   word-break: break-all;
 }
+
+.hint {
+  font-size: 12px;
+  color: #5a6b7d;
+  margin: 0 0 12px;
+  line-height: 1.6;
+}
+
+.range-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 12px;
+  margin-bottom: 10px;
+  flex-wrap: wrap;
+}
+
+.range-row label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 13px;
+  color: #33475b;
+}
+
+.range-row input {
+  width: 200px;
+}
+
+.range-hint {
+  font-size: 13px;
+  color: #5a6b7d;
+  padding-bottom: 9px;
+}
+
+.notice.verify-ok {
+  background: #eafaf1;
+  border-color: #a8e0c1;
+  color: #1e7a43;
+}
+
+.notice.verify-bad {
+  background: #fdecea;
+  border-color: #f3b6ae;
+  color: #9b2c22;
+}
+
+.proof-detail {
+  margin-top: 12px;
+  padding: 10px 12px;
+  background: #f6f9fc;
+  border-radius: 7px;
+  font-size: 13px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.proof-blocks {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.proof-blocks li {
+  color: #33475b;
+}
+
+.proof-blocks .digest {
+  display: block;
+  margin-top: 2px;
+}

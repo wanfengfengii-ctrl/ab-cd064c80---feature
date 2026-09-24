@@ -13,6 +13,8 @@ from fastapi.staticfiles import StaticFiles
 from .storage import (
     CHUNK_SIZE,
     ConflictError,
+    ProofError,
+    ReceiptIntegrityError,
     RejectError,
     UploadStore,
 )
@@ -56,6 +58,18 @@ def _reject_handler(_request: Request, exc: RejectError) -> JSONResponse:
 @app.exception_handler(ConflictError)
 def _conflict_handler(_request: Request, exc: ConflictError) -> JSONResponse:
     return JSONResponse(status_code=409, content={"error": str(exc)})
+
+
+@app.exception_handler(ProofError)
+def _proof_handler(_request: Request, exc: ProofError) -> JSONResponse:
+    return JSONResponse(status_code=exc.status, content={"error": str(exc)})
+
+
+@app.exception_handler(ReceiptIntegrityError)
+def _integrity_handler(_request: Request, exc: ReceiptIntegrityError) -> JSONResponse:
+    # A corrupted receipt is a server-side integrity failure: every proof is
+    # refused and the sealed session stays non-writable.
+    return JSONResponse(status_code=500, content={"error": f"receipt corrupted: {exc}"})
 
 
 @app.get("/health")
@@ -116,6 +130,36 @@ def seal(session: str) -> JSONResponse:
                 "missing_ranges": missing,
             },
         )
+    return JSONResponse(status_code=200, content=result)
+
+
+@app.post("/api/uploads/{session}/commitment")
+def build_legacy_commitment(session: str) -> JSONResponse:
+    """Build an independent commitment record for a legacy (root-less) receipt.
+
+    Requires a complete ordered rescan whose recomputed whole-file digest
+    matches the receipt.  The legacy receipt itself is never modified.
+    """
+    _check_session(session)
+    try:
+        record = store.rescan_legacy_commitment(session)
+    except ProofError as exc:
+        return JSONResponse(status_code=exc.status, content={"error": str(exc)})
+    return JSONResponse(status_code=200, content=record)
+
+
+@app.get("/api/uploads/{session}/proof")
+def range_proof(
+    session: str,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+) -> JSONResponse:
+    """Export proof (boundaries, leaf digests, minimal siblings) for a range."""
+    _check_session(session)
+    try:
+        result = store.proof(session, start, end)
+    except ProofError as exc:
+        return JSONResponse(status_code=exc.status, content={"error": str(exc)})
     return JSONResponse(status_code=200, content=result)
 
 

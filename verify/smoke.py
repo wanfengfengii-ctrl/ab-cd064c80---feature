@@ -3,7 +3,8 @@
 Exercises the whole contract over real HTTP (stdlib only):
   health + SPA, validation, out-of-order PUT, idempotent retransmission,
   409 conflicts that never mutate state, missing-range listing, atomic seal,
-  identical receipt on repeated seal, and sealed-session immutability.
+  identical receipt on repeated seal, sealed-session immutability, and the
+  Merkle commitment/range-proof flow verified by an independent rebuild.
 """
 
 from __future__ import annotations
@@ -18,6 +19,53 @@ import urllib.request
 
 BASE = os.environ.get("BASE_URL", "http://localhost:8000").rstrip("/")
 CHUNK = 65536
+
+# --- independent Merkle verifier (mirrors backend/app/merkle.py) ----------
+
+LEAF_DOMAIN = b"merkle-leaf:v1:"
+NODE_DOMAIN = b"merkle-node:v1:"
+
+
+def leaf_digest(index, length, chunk_sha):
+    payload = json.dumps(
+        {"i": index, "l": length, "d": chunk_sha},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    return hashlib.sha256(LEAF_DOMAIN + payload).digest()
+
+
+def node_digest(left, right):
+    return hashlib.sha256(NODE_DOMAIN + left + right).digest()
+
+
+def evaluate_proof(block, leaf_count):
+    """Rebuild the root from one proof block; raises ValueError on bad shape."""
+    current = leaf_digest(block["index"], block["length"], block["sha256"])
+    pos, count, step = block["index"], leaf_count, 0
+    proof = block["proof"]
+    while count > 1:
+        if pos % 2 == 0 and pos + 1 < count:
+            if step >= len(proof):
+                raise ValueError(f"proof too short at level {step}")
+            item = proof[step]
+            if item["side"] != "right":
+                raise ValueError(f"step {step} side must be right")
+            current = node_digest(current, bytes.fromhex(item["digest"]))
+            step += 1
+        elif pos % 2 == 1:
+            if step >= len(proof):
+                raise ValueError(f"proof too short at level {step}")
+            item = proof[step]
+            if item["side"] != "left":
+                raise ValueError(f"step {step} side must be left")
+            current = node_digest(bytes.fromhex(item["digest"]), current)
+            step += 1
+        pos //= 2
+        count = (count + 1) // 2
+    if step != len(proof):
+        raise ValueError("proof has extra steps")
+    return current.hex()
 
 
 def call(method: str, path: str, body: bytes | None = None, headers=None):
@@ -136,6 +184,60 @@ def main():
           f"seal succeeds with correct digest: {receipt}")
     status, again = call("POST", f"/api/uploads/{s}/seal")
     check(status == 200 and again == receipt, "repeat seal returns the SAME receipt")
+
+    print("[Merkle commitment on the receipt]")
+    root = receipt.get("merkle_root")
+    check(receipt.get("merkle_algorithm") == "merkle-sha256-v1"
+          and isinstance(root, str) and len(root) == 64,
+          f"receipt atomically carries merkle root + algorithm: {receipt.get('merkle_algorithm')}")
+    status, st = call("GET", f"/api/uploads/{s}")
+    check(status == 200 and st["commitment"]["merkle_root"] == root
+          and st["commitment"]["receipt_id"] == receipt["receipt_id"],
+          "commitment record shares root and receipt id")
+
+    print("[range proofs + independent local root rebuild]")
+    status, proof = call("GET", f"/api/uploads/{s}/proof?start=0&end=2")
+    check(status == 200 and [b["index"] for b in proof["blocks"]] == [0, 1, 2],
+          "full-range proof lists blocks 0..2")
+    check(proof["chunk_size"] == CHUNK and proof["file_sha256"] == digest
+          and [b["length"] for b in proof["blocks"]] == [CHUNK, CHUNK, 123],
+          "proof boundaries bind actual block lengths and whole-file digest")
+    for b in proof["blocks"]:
+        rebuilt = evaluate_proof(b, 3)
+        check(rebuilt == root, f"block #{b['index']} rebuilds the committed root")
+        off, ln = b["offset"], b["length"]
+        check(hashlib.sha256(blob[off:off + ln]).hexdigest() == b["sha256"],
+              f"block #{b['index']} digest matches its raw bytes")
+    status, sub = call("GET", f"/api/uploads/{s}/proof?start=1&end=2")
+    check(status == 200 and [b["index"] for b in sub["blocks"]] == [1, 2],
+          "contiguous sub-range 1..2 exported")
+    for b in sub["blocks"]:
+        check(evaluate_proof(b, 3) == root, f"sub-range block #{b['index']} verifies")
+
+    print("[first-mismatch reporting on tampered proof]")
+    evil = json.loads(json.dumps(proof))
+    evil["blocks"][1]["proof"][0]["digest"] = "00" * 32
+    check(evaluate_proof(evil["blocks"][1], 3) != root,
+          "tampered sibling rebuilds a DIFFERENT root (first mismatch detectable)")
+    evil2 = json.loads(json.dumps(proof))
+    evil2["blocks"][0]["length"] = CHUNK - 1
+    check(evaluate_proof(evil2["blocks"][0], 3) != root,
+          "tampered block length rebuilds a DIFFERENT root")
+
+    print("[proof endpoint validation]")
+    for q, want in [("?start=2&end=1", 400), ("?start=0&end=3", 400),
+                    ("?start=01&end=2", 400), ("", 400)]:
+        status, body = call("GET", f"/api/uploads/{s}/proof{q}")
+        check(status == want, f"proof{q or ' (no range)'} -> {want}, got {status}: {body}")
+    status, body = call("GET", f"/api/uploads/NOPE9/proof?start=0&end=0")
+    check(status == 404, f"unknown session proof -> 404, got {status}")
+
+    print("[commitment rescan is idempotent / sealed-only]")
+    status, rec = call("POST", f"/api/uploads/{s}/commitment")
+    check(status == 200 and rec["merkle_root"] == root and rec["receipt_id"] == receipt["receipt_id"],
+          "commitment rescan returns the same independent record")
+    status, body = call("POST", "/api/uploads/NOPE9/commitment")
+    check(status == 404, f"unknown session rescan -> 404, got {status}")
 
     print("[sealed immutability]")
     wrong0 = bytes(CHUNK)  # all-zero chunk, differs from random c0
